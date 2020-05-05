@@ -1,7 +1,7 @@
 // Copyright (c) The Thanos Authors.
 // Licensed under the Apache License 2.0.
 
-package manager
+package rules
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fortytw2/leaktest"
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
@@ -53,27 +54,29 @@ groups:
 		queryOnce sync.Once
 		query     string
 	)
-	opts := rules.ManagerOptions{
-		Logger:  log.NewLogfmtLogger(os.Stderr),
-		Context: context.Background(),
-		QueryFunc: func(ctx context.Context, q string, t time.Time) (vectors promql.Vector, e error) {
-			queryOnce.Do(func() {
-				query = q
-				close(queryDone)
-			})
-			return promql.Vector{}, nil
+	thanosRuleMgr := NewManager(
+		context.Background(),
+		nil,
+		dir,
+		rules.ManagerOptions{
+			Logger:     log.NewLogfmtLogger(os.Stderr),
+			Context:    context.Background(),
+			Appendable: nopAppendable{},
 		},
-		Appendable: nopAppendable{},
-	}
-	thanosRuleMgr := NewManager(dir)
-	ruleMgr := rules.NewManager(&opts)
-	thanosRuleMgr.SetRuleManager(storepb.PartialResponseStrategy_ABORT, ruleMgr)
-	thanosRuleMgr.SetRuleManager(storepb.PartialResponseStrategy_WARN, ruleMgr)
-
+		func(partialResponseStrategy storepb.PartialResponseStrategy) rules.QueryFunc {
+			return func(ctx context.Context, q string, t time.Time) (vectors promql.Vector, e error) {
+				queryOnce.Do(func() {
+					query = q
+					close(queryDone)
+				})
+				return promql.Vector{}, nil
+			}
+		},
+	)
 	testutil.Ok(t, thanosRuleMgr.Update(10*time.Second, []string{filepath.Join(dir, "rule.yaml")}))
 
-	ruleMgr.Run()
-	defer ruleMgr.Stop()
+	thanosRuleMgr.Run()
+	defer thanosRuleMgr.Stop()
 
 	select {
 	case <-time.After(2 * time.Minute):
@@ -84,7 +87,7 @@ groups:
 	testutil.Equals(t, "rate(some_metric[1h:5m] offset 1d)", query)
 }
 
-func TestUpdate(t *testing.T) {
+func TestUpdate_Error_UpdatePartial(t *testing.T) {
 	dir, err := ioutil.TempDir("", "test_rule_rule_groups")
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
@@ -148,14 +151,20 @@ groups:
     expr: "up"
 `), os.ModePerm))
 
-	opts := rules.ManagerOptions{
-		Logger: log.NewLogfmtLogger(os.Stderr),
-	}
-	m := NewManager(dir)
-	m.SetRuleManager(storepb.PartialResponseStrategy_ABORT, rules.NewManager(&opts))
-	m.SetRuleManager(storepb.PartialResponseStrategy_WARN, rules.NewManager(&opts))
-
-	err = m.Update(10*time.Second, []string{
+	thanosRuleMgr := NewManager(
+		context.Background(),
+		nil,
+		dir,
+		rules.ManagerOptions{
+			Logger: log.NewLogfmtLogger(os.Stderr),
+		},
+		func(partialResponseStrategy storepb.PartialResponseStrategy) rules.QueryFunc {
+			return func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
+				return nil, nil
+			}
+		},
+	)
+	err = thanosRuleMgr.Update(10*time.Second, []string{
 		filepath.Join(dir, "no_strategy.yaml"),
 		filepath.Join(dir, "abort.yaml"),
 		filepath.Join(dir, "warn.yaml"),
@@ -169,7 +178,7 @@ groups:
 	testutil.Assert(t, strings.Contains(err.Error(), "wrong.yaml: failed to unmarshal 'partial_response_strategy'"), err.Error())
 	testutil.Assert(t, strings.Contains(err.Error(), "non_existing.yaml: no such file or directory"), err.Error())
 
-	g := m.RuleGroups()
+	g := thanosRuleMgr.RuleGroups()
 	sort.Slice(g, func(i, j int) bool {
 		return g[i].Name() < g[j].Name()
 	})
@@ -216,11 +225,16 @@ groups:
 		},
 	}
 	testutil.Equals(t, len(exp), len(g))
+
 	for i := range exp {
 		t.Run(exp[i].name, func(t *testing.T) {
 			testutil.Equals(t, exp[i].strategy, g[i].PartialResponseStrategy)
 			testutil.Equals(t, exp[i].name, g[i].Name())
-			testutil.Equals(t, exp[i].file, g[i].OriginalFile())
+
+			p := g[i].ToProto()
+			testutil.Equals(t, exp[i].strategy, p.PartialResponseStrategy)
+			testutil.Equals(t, exp[i].name, p.Name)
+			testutil.Equals(t, exp[i].file, p.File)
 		})
 	}
 }
@@ -239,8 +253,8 @@ func TestRuleGroupMarshalYAML(t *testing.T) {
 `
 
 	a := storepb.PartialResponseStrategy_ABORT
-	var input = RuleGroups{
-		Groups: []RuleGroup{
+	var input = configRuleGroups{
+		Groups: []configRuleGroup{
 			{
 				RuleGroup: rulefmt.RuleGroup{
 					Name: "something1",
@@ -271,4 +285,34 @@ func TestRuleGroupMarshalYAML(t *testing.T) {
 	testutil.Ok(t, err)
 
 	testutil.Equals(t, expected, string(b))
+}
+
+func TestManager_Rules(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+
+	dir, err := ioutil.TempDir("", "test_rule_run")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+
+	curr, err := os.Getwd()
+	testutil.Ok(t, err)
+
+	thanosRuleMgr := NewManager(
+		context.Background(),
+		nil,
+		dir,
+		rules.ManagerOptions{
+			Logger: log.NewLogfmtLogger(os.Stderr),
+		},
+		func(partialResponseStrategy storepb.PartialResponseStrategy) rules.QueryFunc {
+			return func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
+				return nil, nil
+			}
+		},
+	)
+	testutil.Ok(t, thanosRuleMgr.Update(10*time.Second, []string{
+		filepath.Join(curr, "../../examples/alerts/alerts.yaml"),
+		filepath.Join(curr, "../../examples/alerts/rules.yaml"),
+	}))
+	testRulesAgainstExamples(t, filepath.Join(curr, "examples/alerts"), thanosRuleMgr)
 }

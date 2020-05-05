@@ -10,7 +10,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 )
 
-// Prometheus implements rulespb.Rules.
+// Prometheus implements rulespb.Rules gRPC that allows to fetch rules from Prometheus HTTP api/v1/rules endpoint.
 type Prometheus struct {
 	base   *url.URL
 	client *promclient.Client
